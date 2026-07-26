@@ -50,6 +50,8 @@ def run_spotdl(url: str, output_directory: Path) -> Path:
         str(output_directory / "{artists} - {title}.{output-ext}"),
         "--simple-tui",
         "--print-errors",
+        "--log-level",
+        "ERROR",
     ]
     try:
         result = subprocess.run(
@@ -65,7 +67,14 @@ def run_spotdl(url: str, output_directory: Path) -> Path:
 
     files = sorted(output_directory.glob("*.mp3"), key=lambda path: path.stat().st_mtime, reverse=True)
     if result.returncode != 0 or not files:
-        message = (result.stderr or result.stdout or "SpotDL could not convert this track.").strip().splitlines()[-1]
+        output = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        message = lines[-1] if lines else "SpotDL could not convert this track."
+        lowered = output.lower()
+        if "sign in to confirm" in lowered or "not a bot" in lowered:
+            message = "YouTube temporarily blocked this cloud server. Try again later or upload the audio file directly."
+        elif "no results found" in lowered:
+            message = "SpotDL could not find a matching audio result for this track."
         raise HTTPException(status_code=422, detail=message[:240])
     if len(files) > 1:
         raise HTTPException(status_code=400, detail="Paste one track link, not a playlist or album.")
