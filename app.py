@@ -4,21 +4,28 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.background import BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="MusicPocket SpotDL Companion", docs_url=None, redoc_url=None)
 conversion_slot = asyncio.Semaphore(max(1, int(os.getenv("SPOTDL_CONCURRENCY", "1"))))
 allowed_hosts = ("youtube.com", "youtu.be", "spotify.com")
+local_companion_url: str | None = None
+local_companion_seen = 0.0
 
 
 class ConvertRequest(BaseModel):
+    url: str
+
+
+class RegisterRequest(BaseModel):
     url: str
 
 
@@ -37,6 +44,62 @@ def authorize(value: str | None) -> None:
         raise HTTPException(status_code=503, detail="The SpotDL service is not configured.")
     if value != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="Unauthorized.")
+
+
+def normalize_companion_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host.endswith(".trycloudflare.com"):
+        raise HTTPException(status_code=400, detail="Use a valid MusicPocket tunnel address.")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def check_companion(base_url: str) -> None:
+    request = Request(f"{base_url}/health", headers={"User-Agent": "MusicPocket-Relay/1.0"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            if response.status != 200:
+                raise HTTPException(status_code=502, detail="The Windows companion is not reachable.")
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="The Windows companion is not reachable.") from error
+
+
+def open_companion_conversion(base_url: str, payload: ConvertRequest, token: str):
+    request = Request(
+        f"{base_url}/v1/convert",
+        data=json.dumps({"url": payload.url}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg, application/json",
+            "User-Agent": "MusicPocket-Relay/1.0",
+        },
+    )
+    try:
+        return urlopen(request, timeout=7 * 60)
+    except HTTPError as error:
+        try:
+            failure = json.loads(error.read().decode())
+            detail = str(failure.get("detail") or "SpotDL could not convert this track.")
+        except Exception:
+            detail = "SpotDL could not convert this track."
+        raise HTTPException(status_code=error.code, detail=detail[:240]) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
+        ) from error
+
+
+def stream_companion(response):
+    try:
+        while chunk := response.read(64 * 1024):
+            yield chunk
+    finally:
+        response.close()
 
 
 def resolve_spotdl_query(url: str) -> str:
@@ -115,37 +178,61 @@ def run_spotdl(url: str, output_directory: Path) -> Path:
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "windows_companion": bool(
+            local_companion_url and time.monotonic() - local_companion_seen < 120
+        ),
+    }
+
+
+@app.post("/v1/register")
+async def register(
+    payload: RegisterRequest,
+    authorization: str | None = Header(default=None),
+):
+    authorize(authorization)
+    base_url = normalize_companion_url(payload.url)
+    await asyncio.to_thread(check_companion, base_url)
+
+    global local_companion_url, local_companion_seen
+    local_companion_url = base_url
+    local_companion_seen = time.monotonic()
+    return {"connected": True}
 
 
 @app.post("/v1/convert")
 async def convert(
     payload: ConvertRequest,
-    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ):
     authorize(authorization)
     if not is_allowed_url(payload.url):
         raise HTTPException(status_code=400, detail="Use a valid YouTube, YouTube Music, or Spotify URL.")
 
-    work_directory = Path(tempfile.mkdtemp(prefix="musicpocket-"))
-    try:
-        async with conversion_slot:
-            output_file = await asyncio.to_thread(run_spotdl, payload.url, work_directory)
-        safe_name = output_file.name[:255]
-        title = output_file.stem[:160]
-        background_tasks.add_task(shutil.rmtree, work_directory, True)
-        return FileResponse(
-            output_file,
-            media_type="audio/mpeg",
-            filename=safe_name,
-            background=background_tasks,
-            headers={
-                "X-MusicPocket-Filename": quote(safe_name),
-                "X-MusicPocket-Title": quote(title),
-                "Cache-Control": "no-store",
-            },
+    if not local_companion_url or time.monotonic() - local_companion_seen >= 120:
+        raise HTTPException(
+            status_code=503,
+            detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
         )
-    except Exception:
-        shutil.rmtree(work_directory, ignore_errors=True)
-        raise
+
+    token = os.getenv("SPOTDL_API_TOKEN", "")
+    async with conversion_slot:
+        upstream = await asyncio.to_thread(
+            open_companion_conversion,
+            local_companion_url,
+            payload,
+            token,
+        )
+
+    headers = {"Cache-Control": "no-store"}
+    for name in ("Content-Length", "X-MusicPocket-Filename", "X-MusicPocket-Title"):
+        value = upstream.headers.get(name)
+        if value:
+            headers[name] = value
+
+    return StreamingResponse(
+        stream_companion(upstream),
+        media_type=(upstream.headers.get("Content-Type") or "audio/mpeg").split(";")[0],
+        headers=headers,
+    )
