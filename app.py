@@ -1,10 +1,12 @@
 import asyncio
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.background import BackgroundTasks
@@ -37,11 +39,33 @@ def authorize(value: str | None) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
 
+def resolve_spotdl_query(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host != "youtu.be" and host != "youtube.com" and not host.endswith(".youtube.com"):
+        return url
+
+    endpoint = "https://www.youtube.com/oembed?" + urlencode({"url": url, "format": "json"})
+    request = Request(endpoint, headers={"User-Agent": "MusicPocket/1.0"})
+    try:
+        with urlopen(request, timeout=12) as response:
+            metadata = json.load(response)
+        title = str(metadata.get("title", "")).strip()
+        author = str(metadata.get("author_name", "")).strip()
+        if author.endswith(" - Topic"):
+            author = author[:-8].strip()
+        if title:
+            return f"{author} - {title}" if author else title
+    except Exception:
+        pass
+    return url
+
+
 def run_spotdl(url: str, output_directory: Path) -> Path:
+    query = resolve_spotdl_query(url)
     command = [
         "spotdl",
         "download",
-        url,
+        query,
         "--audio",
         "piped",
         "soundcloud",
