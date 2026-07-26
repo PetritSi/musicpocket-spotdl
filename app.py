@@ -67,31 +67,41 @@ def check_companion(base_url: str) -> None:
 
 
 def open_companion_conversion(base_url: str, payload: ConvertRequest, token: str):
-    request = Request(
-        f"{base_url}/v1/convert",
-        data=json.dumps({"url": payload.url}).encode(),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "audio/mpeg, application/json",
-            "User-Agent": "MusicPocket-Relay/1.0",
-        },
-    )
-    try:
-        return urlopen(request, timeout=7 * 60)
-    except HTTPError as error:
+    for attempt in range(3):
+        request = Request(
+            f"{base_url}/v1/convert",
+            data=json.dumps({"url": payload.url}).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg, application/json",
+                "User-Agent": "MusicPocket-Relay/1.0",
+            },
+        )
         try:
-            failure = json.loads(error.read().decode())
-            detail = str(failure.get("detail") or "SpotDL could not convert this track.")
-        except Exception:
-            detail = "SpotDL could not convert this track."
-        raise HTTPException(status_code=error.code, detail=detail[:240]) from error
-    except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
-        ) from error
+            return urlopen(request, timeout=7 * 60)
+        except HTTPError as error:
+            body = error.read()
+            if error.code in (502, 503, 504) and attempt < 2:
+                time.sleep(2)
+                continue
+            try:
+                failure = json.loads(body.decode())
+                detail = str(failure.get("detail") or "SpotDL could not convert this track.")
+            except Exception:
+                detail = "SpotDL could not convert this track."
+            raise HTTPException(status_code=error.code, detail=detail[:240]) from error
+        except Exception as error:
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
+            ) from error
+
+    raise HTTPException(status_code=502, detail="The Windows companion is offline.")
 
 
 def stream_companion(response):
