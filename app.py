@@ -193,7 +193,6 @@ async def register(
 ):
     authorize(authorization)
     base_url = normalize_companion_url(payload.url)
-    await asyncio.to_thread(check_companion, base_url)
 
     global local_companion_url, local_companion_seen
     local_companion_url = base_url
