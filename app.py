@@ -8,7 +8,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, Header, HTTPException
@@ -98,6 +98,73 @@ def resolve_spotdl_query(url: str) -> str:
     return url
 
 
+def youtube_video_id(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host == "youtu.be":
+        return parsed.path.strip("/").split("/", 1)[0]
+    if host == "youtube.com" or host.endswith(".youtube.com"):
+        return parse_qs(parsed.query).get("v", [""])[0]
+    return ""
+
+
+def ffmpeg_location() -> str | None:
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+    bundled = Path.home() / ".spotdl" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    return str(bundled) if bundled.exists() else None
+
+
+def download_youtube_fallback(
+    query: str,
+    output_directory: Path,
+    unavailable_url: str,
+) -> Path | None:
+    unavailable_id = youtube_video_id(unavailable_url)
+    candidates = search_youtube(query, 5)
+    for candidate in candidates:
+        candidate_url = str(candidate.get("url", ""))
+        if not candidate_url or youtube_video_id(candidate_url) == unavailable_id:
+            continue
+
+        options = {
+            "format": "bestaudio/best",
+            "outtmpl": str(output_directory / "%(title).160B.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+            "retries": 3,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "128",
+            }],
+        }
+        ffmpeg = ffmpeg_location()
+        if ffmpeg:
+            options["ffmpeg_location"] = ffmpeg
+
+        before = set(output_directory.glob("*.mp3"))
+        try:
+            with YoutubeDL(options) as downloader:
+                downloader.download([candidate_url])
+        except Exception as error:
+            logger.warning("YouTube fallback candidate %s failed: %s", candidate_url, error)
+            continue
+
+        files = sorted(
+            (path for path in output_directory.glob("*.mp3") if path not in before),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if files:
+            logger.info("Used YouTube fallback %s for unavailable source %s.", candidate_url, unavailable_url)
+            return files[0]
+    return None
+
+
 def run_spotdl(url: str, output_directory: Path) -> Path:
     query = resolve_spotdl_query(url)
     executable = shutil.which("spotdl")
@@ -143,11 +210,18 @@ def run_spotdl(url: str, output_directory: Path) -> Path:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         message = lines[-1] if lines else "SpotDL could not convert this track."
         lowered = output.lower()
-        if "sign in to confirm" in lowered or "not a bot" in lowered:
+        logger.warning("SpotDL failed for %s: %s", url, message)
+        fallback_file = None
+        if youtube_video_id(url) and ("video unavailable" in lowered or "yt-dlp download error" in lowered):
+            fallback_file = download_youtube_fallback(query, output_directory, url)
+        if fallback_file:
+            files = [fallback_file]
+        elif "sign in to confirm" in lowered or "not a bot" in lowered:
             message = "YouTube temporarily blocked this cloud server. Try again later or upload the audio file directly."
         elif "no results found" in lowered:
             message = "SpotDL could not find a matching audio result for this track."
-        raise HTTPException(status_code=422, detail=message[:240])
+        if not fallback_file:
+            raise HTTPException(status_code=422, detail=message[:240])
     if len(files) > 1:
         raise HTTPException(status_code=400, detail="Paste one track link, not a playlist or album.")
     if files[0].stat().st_size > 75 * 1024 * 1024:

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -79,6 +80,35 @@ class CloudCompanionTests(unittest.IsolatedAsyncioTestCase):
                 AUTHORIZATION,
             )
         self.assertEqual(invalid.exception.status_code, 400)
+
+    def test_unavailable_youtube_source_uses_search_fallback(self):
+        fallback_file = Path(__file__).parent / "Example Artist - Example Song.mp3"
+        failed_download = subprocess.CompletedProcess(
+            args=["spotdl"],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "Video unavailable. This video is not available\n"
+                "YT-DLP download error - https://www.youtube.com/watch?v=unavailable"
+            ),
+        )
+
+        with (
+            patch.object(companion, "resolve_spotdl_query", return_value="Artist - Song"),
+            patch.object(companion.subprocess, "run", return_value=failed_download),
+            patch.object(companion, "download_youtube_fallback", return_value=fallback_file) as fallback,
+        ):
+            result = companion.run_spotdl(
+                "https://www.youtube.com/watch?v=unavailable",
+                Path(__file__).parent,
+            )
+
+        self.assertEqual(result, fallback_file)
+        fallback.assert_called_once_with(
+            "Artist - Song",
+            Path(__file__).parent,
+            "https://www.youtube.com/watch?v=unavailable",
+        )
 
 
 if __name__ == "__main__":
