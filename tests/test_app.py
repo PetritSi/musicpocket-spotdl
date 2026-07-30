@@ -110,6 +110,51 @@ class CloudCompanionTests(unittest.IsolatedAsyncioTestCase):
             "https://www.youtube.com/watch?v=unavailable",
         )
 
+    def test_proxy_is_applied_to_spotdl_and_youtube_search(self):
+        proxy = "http://proxy-user:proxy-password@proxy.example:1234"
+        successful_download = subprocess.CompletedProcess(
+            args=["spotdl"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        captured_options = {}
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                captured_options.update(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def extract_info(self, *_args, **_kwargs):
+                return {"entries": []}
+
+        with (
+            patch.dict(os.environ, {"SPOTDL_PROXY_URL": proxy}),
+            patch.object(companion, "resolve_spotdl_query", return_value="Artist - Song"),
+            patch.object(companion.subprocess, "run", return_value=successful_download) as run,
+        ):
+            companion.run_spotdl(
+                "https://www.youtube.com/watch?v=available",
+                Path(__file__).parent,
+            )
+            with patch.object(companion, "YoutubeDL", FakeYoutubeDL):
+                companion.search_youtube("Artist Song", 3)
+
+        command = run.call_args.args[0]
+        proxy_index = command.index("--proxy")
+        self.assertEqual(command[proxy_index + 1], proxy)
+        self.assertEqual(captured_options["proxy"], proxy)
+
+    def test_rejects_invalid_proxy_configuration(self):
+        with patch.dict(os.environ, {"SPOTDL_PROXY_URL": "not-a-proxy"}):
+            with self.assertRaisesRegex(RuntimeError, "valid HTTP or HTTPS proxy URL"):
+                companion.proxy_url()
+
 
 if __name__ == "__main__":
     unittest.main()

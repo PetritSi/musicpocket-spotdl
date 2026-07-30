@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.background import BackgroundTasks
@@ -29,6 +29,16 @@ class ConvertRequest(BaseModel):
     url: str
 
 
+def proxy_url() -> str | None:
+    value = os.getenv("SPOTDL_PROXY_URL", "").strip()
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("SPOTDL_PROXY_URL must be a valid HTTP or HTTPS proxy URL.")
+    return value
+
+
 def search_youtube(query: str, limit: int) -> list[dict]:
     options = {
         "quiet": True,
@@ -38,6 +48,9 @@ def search_youtube(query: str, limit: int) -> list[dict]:
         "playlistend": limit,
         "socket_timeout": 15,
     }
+    proxy = proxy_url()
+    if proxy:
+        options["proxy"] = proxy
     with YoutubeDL(options) as downloader:
         data = downloader.extract_info(f"ytsearch{limit}:{query}", download=False)
 
@@ -85,7 +98,13 @@ def resolve_spotdl_query(url: str) -> str:
     endpoint = "https://www.youtube.com/oembed?" + urlencode({"url": url, "format": "json"})
     request = Request(endpoint, headers={"User-Agent": "MusicPocket/1.0"})
     try:
-        with urlopen(request, timeout=12) as response:
+        proxy = proxy_url()
+        if proxy:
+            opener = build_opener(ProxyHandler({"http": proxy, "https": proxy}))
+            response_context = opener.open(request, timeout=12)
+        else:
+            response_context = urlopen(request, timeout=12)
+        with response_context as response:
             metadata = json.load(response)
         title = str(metadata.get("title", "")).strip()
         author = str(metadata.get("author_name", "")).strip()
@@ -145,6 +164,9 @@ def download_youtube_fallback(
         ffmpeg = ffmpeg_location()
         if ffmpeg:
             options["ffmpeg_location"] = ffmpeg
+        proxy = proxy_url()
+        if proxy:
+            options["proxy"] = proxy
 
         before = set(output_directory.glob("*.mp3"))
         try:
@@ -192,6 +214,9 @@ def run_spotdl(url: str, output_directory: Path) -> Path:
         "--log-level",
         "ERROR",
     ]
+    proxy = proxy_url()
+    if proxy:
+        command.extend(["--proxy", proxy])
     try:
         result = subprocess.run(
             command,

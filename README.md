@@ -15,7 +15,12 @@ Optional:
 
 ```text
 SPOTDL_CONCURRENCY=1
+SPOTDL_PROXY_URL=http://username:password@proxy-host:port
 ```
+
+`SPOTDL_PROXY_URL` should be stored only as a secret environment variable. A
+residential HTTP(S) proxy is required when the hosting provider's data-center
+IP is blocked by YouTube. Never commit proxy credentials to the repository.
 
 Then configure MusicPocket with the same token and the container endpoint:
 
