@@ -1,6 +1,9 @@
-# MusicPocket SpotDL companion
+# MusicPocket cloud companion
 
-This private service runs SpotDL and FFmpeg outside the Cloudflare Worker. Deploy the folder as a Docker service on a platform such as Railway, Render, Fly.io, or your own server.
+This private service runs SpotDL, yt-dlp, Deno, and FFmpeg in the cloud so
+MusicPocket can search and import music from a phone without a Windows PC.
+Deploy the folder as a single Docker service on Render, Railway, Fly.io, or a
+small VPS.
 
 Set one required environment variable on the container:
 
@@ -21,4 +24,19 @@ SPOTDL_API_URL=https://your-service.example/v1/convert
 SPOTDL_API_TOKEN=a-long-random-secret
 ```
 
-The endpoint accepts a single YouTube, YouTube Music, or Spotify track URL. It intentionally rejects unrelated hosts and files larger than 75 MB.
+The service provides:
+
+- `GET /health`
+- `GET /v1/search`
+- `POST /v1/jobs`
+- `GET /v1/jobs/{job_id}`
+- `GET /v1/jobs/{job_id}/file`
+- `POST /v1/convert` for backwards compatibility
+
+It accepts one YouTube, YouTube Music, or Spotify track URL, rejects unrelated
+hosts, limits conversions to 75 MB, and deletes temporary files after delivery.
+Use one container instance so its short-lived job state remains consistent.
+
+For truly continuous availability, use a service plan that does not sleep when
+idle. A sleeping free instance can still work, but the first request may need
+time to wake up.
