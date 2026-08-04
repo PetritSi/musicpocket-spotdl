@@ -21,6 +21,9 @@ class CloudCompanionTests(unittest.IsolatedAsyncioTestCase):
         self.environment.start()
         companion.jobs.clear()
         companion.job_tasks.clear()
+        companion.relay_jobs.clear()
+        companion.local_companion_url = None
+        companion.local_companion_seen = 0.0
         self.temp_directory = patch.object(
             companion.tempfile,
             "mkdtemp",
@@ -32,6 +35,9 @@ class CloudCompanionTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         companion.jobs.clear()
+        companion.relay_jobs.clear()
+        companion.local_companion_url = None
+        companion.local_companion_seen = 0.0
         self.remove_directory.stop()
         self.temp_directory.stop()
         self.environment.stop()
@@ -65,6 +71,39 @@ class CloudCompanionTests(unittest.IsolatedAsyncioTestCase):
         response = await companion.job_file(job_id, BackgroundTasks(), AUTHORIZATION)
         self.assertEqual(response.media_type, "audio/mpeg")
         self.assertEqual(response.headers["x-musicpocket-title"], "Example%20Artist%20-%20Example%20Song")
+
+    async def test_registered_windows_companion_handles_search_and_jobs(self):
+        await companion.register(
+            companion.RegisterRequest(url="https://personal-music.trycloudflare.com"),
+            AUTHORIZATION,
+        )
+
+        job_id = "a" * 32
+        with patch.object(
+            companion,
+            "companion_json",
+            side_effect=[
+                (200, {"results": [{"id": "video", "title": "Example Song"}]}),
+                (202, {"job_id": job_id, "status": "queued"}),
+                (200, {"job_id": job_id, "status": "ready"}),
+            ],
+        ) as relay:
+            search = await companion.youtube_search("Example Song", 5, AUTHORIZATION)
+            created = await companion.create_job(
+                companion.ConvertRequest(url="https://open.spotify.com/track/example"),
+                AUTHORIZATION,
+            )
+            status = await companion.job_status(job_id, AUTHORIZATION)
+
+        health = await companion.health()
+        self.assertEqual(health["mode"], "relay")
+        self.assertTrue(health["windows_companion"])
+        self.assertEqual(search["results"][0]["title"], "Example Song")
+        self.assertEqual(created["job_id"], job_id)
+        self.assertEqual(status["status"], "ready")
+        self.assertIn("/v1/search?", relay.call_args_list[0].args[1])
+        self.assertEqual(relay.call_args_list[1].args[1], "/v1/jobs")
+        self.assertEqual(relay.call_args_list[2].args[1], f"/v1/jobs/{job_id}")
 
     async def test_rejects_invalid_or_unauthorized_jobs(self):
         with self.assertRaises(HTTPException) as unauthorized:

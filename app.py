@@ -8,12 +8,13 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.background import BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from yt_dlp import YoutubeDL
 
@@ -23,9 +24,16 @@ conversion_slot = asyncio.Semaphore(max(1, int(os.getenv("SPOTDL_CONCURRENCY", "
 allowed_hosts = ("youtube.com", "youtu.be", "spotify.com")
 jobs: dict[str, dict] = {}
 job_tasks: set[asyncio.Task] = set()
+relay_jobs: dict[str, dict] = {}
+local_companion_url: str | None = None
+local_companion_seen = 0.0
 
 
 class ConvertRequest(BaseModel):
+    url: str
+
+
+class RegisterRequest(BaseModel):
     url: str
 
 
@@ -88,6 +96,143 @@ def authorize(value: str | None) -> None:
         raise HTTPException(status_code=503, detail="The SpotDL service is not configured.")
     if value != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="Unauthorized.")
+
+
+def normalize_companion_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host.endswith(".trycloudflare.com"):
+        raise HTTPException(status_code=400, detail="Use a valid MusicPocket tunnel address.")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def active_companion_url() -> str | None:
+    if local_companion_url and time.monotonic() - local_companion_seen < 120:
+        return local_companion_url
+    return None
+
+
+def companion_json(
+    base_url: str,
+    path: str,
+    token: str,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+):
+    data = json.dumps(body).encode() if body is not None else None
+    for attempt in range(3):
+        request = Request(
+            f"{base_url}{path}",
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "MusicPocket-Relay/1.0",
+            },
+        )
+        try:
+            with urlopen(request, timeout=35) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            response_body = error.read()
+            if error.code in (502, 503, 504) and attempt < 2:
+                time.sleep(2)
+                continue
+            try:
+                failure = json.loads(response_body.decode())
+                detail = str(failure.get("detail") or "SpotDL could not complete this request.")
+            except Exception:
+                detail = "SpotDL could not complete this request."
+            raise HTTPException(status_code=error.code, detail=detail[:240]) from error
+        except Exception as error:
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
+            ) from error
+
+    raise HTTPException(status_code=502, detail="The Windows companion is offline.")
+
+
+def open_companion_file(base_url: str, path: str, token: str, timeout: int = 120):
+    request = Request(
+        f"{base_url}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "audio/mpeg, application/json",
+            "User-Agent": "MusicPocket-Relay/1.0",
+        },
+    )
+    try:
+        return urlopen(request, timeout=timeout)
+    except HTTPError as error:
+        body = error.read()
+        try:
+            failure = json.loads(body.decode())
+            detail = str(failure.get("detail") or "SpotDL could not return this track.")
+        except Exception:
+            detail = "SpotDL could not return this track."
+        raise HTTPException(status_code=error.code, detail=detail[:240]) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
+        ) from error
+
+
+def open_companion_conversion(base_url: str, payload: ConvertRequest, token: str):
+    request = Request(
+        f"{base_url}/v1/convert",
+        data=json.dumps({"url": payload.url}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg, application/json",
+            "User-Agent": "MusicPocket-Relay/1.0",
+        },
+    )
+    try:
+        return urlopen(request, timeout=7 * 60)
+    except HTTPError as error:
+        body = error.read()
+        try:
+            failure = json.loads(body.decode())
+            detail = str(failure.get("detail") or "SpotDL could not convert this track.")
+        except Exception:
+            detail = "SpotDL could not convert this track."
+        raise HTTPException(status_code=error.code, detail=detail[:240]) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail="The Windows companion is offline. Turn on the PC, wait a moment, and try again.",
+        ) from error
+
+
+def stream_companion(response):
+    try:
+        while chunk := response.read(64 * 1024):
+            yield chunk
+    finally:
+        response.close()
+
+
+def companion_audio_response(upstream):
+    headers = {"Cache-Control": "no-store"}
+    for name in ("Content-Length", "X-MusicPocket-Filename", "X-MusicPocket-Title"):
+        value = upstream.headers.get(name)
+        if value:
+            headers[name] = value
+    return StreamingResponse(
+        stream_companion(upstream),
+        media_type=(upstream.headers.get("Content-Type") or "audio/mpeg").split(";")[0],
+        headers=headers,
+    )
 
 
 def resolve_spotdl_query(url: str) -> str:
@@ -299,11 +444,27 @@ def retain_task(task: asyncio.Task) -> None:
 
 @app.get("/health")
 async def health():
+    companion_url = active_companion_url()
     return {
         "ok": True,
-        "mode": "cloud",
+        "mode": "relay" if companion_url else "cloud",
+        "windows_companion": bool(companion_url),
         "active_jobs": sum(job["status"] in {"queued", "running"} for job in jobs.values()),
     }
+
+
+@app.post("/v1/register")
+async def register(
+    payload: RegisterRequest,
+    authorization: str | None = Header(default=None),
+):
+    authorize(authorization)
+    base_url = normalize_companion_url(payload.url)
+
+    global local_companion_url, local_companion_seen
+    local_companion_url = base_url
+    local_companion_seen = time.monotonic()
+    return {"connected": True}
 
 
 @app.get("/v1/search")
@@ -316,6 +477,15 @@ async def youtube_search(
     query = q.strip()[:120]
     if len(query) < 2:
         raise HTTPException(status_code=400, detail="Enter at least two characters.")
+    companion_url = active_companion_url()
+    if companion_url:
+        _, result = await asyncio.to_thread(
+            companion_json,
+            companion_url,
+            f"/v1/search?{urlencode({'q': query, 'limit': max(1, min(limit, 10))})}",
+            os.getenv("SPOTDL_API_TOKEN", ""),
+        )
+        return result
     try:
         results = await asyncio.to_thread(search_youtube, query, max(1, min(limit, 10)))
         return {"results": results}
@@ -331,6 +501,25 @@ async def create_job(
     authorize(authorization)
     if not is_allowed_url(payload.url):
         raise HTTPException(status_code=400, detail="Use a valid YouTube, YouTube Music, or Spotify URL.")
+
+    companion_url = active_companion_url()
+    if companion_url:
+        _, result = await asyncio.to_thread(
+            companion_json,
+            companion_url,
+            "/v1/jobs",
+            os.getenv("SPOTDL_API_TOKEN", ""),
+            method="POST",
+            body={"url": payload.url},
+        )
+        job_id = str(result.get("job_id", ""))
+        if not job_id:
+            raise HTTPException(status_code=502, detail="The Windows companion returned an invalid job.")
+        relay_jobs[job_id] = {
+            "base_url": companion_url,
+            "created_at": time.time(),
+        }
+        return {"job_id": job_id, "status": result.get("status", "queued")}
 
     cleanup_expired_jobs()
     job_id = uuid.uuid4().hex
@@ -349,6 +538,15 @@ async def job_status(
     authorization: str | None = Header(default=None),
 ):
     authorize(authorization)
+    relay_job = relay_jobs.get(job_id)
+    if relay_job:
+        _, result = await asyncio.to_thread(
+            companion_json,
+            relay_job["base_url"],
+            f"/v1/jobs/{job_id}",
+            os.getenv("SPOTDL_API_TOKEN", ""),
+        )
+        return result
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="This conversion job is no longer available.")
@@ -368,6 +566,16 @@ async def job_file(
     authorization: str | None = Header(default=None),
 ):
     authorize(authorization)
+    relay_job = relay_jobs.get(job_id)
+    if relay_job:
+        upstream = await asyncio.to_thread(
+            open_companion_file,
+            relay_job["base_url"],
+            f"/v1/jobs/{job_id}/file",
+            os.getenv("SPOTDL_API_TOKEN", ""),
+        )
+        relay_jobs.pop(job_id, None)
+        return companion_audio_response(upstream)
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="This conversion job is no longer available.")
@@ -397,6 +605,16 @@ async def convert(
     authorize(authorization)
     if not is_allowed_url(payload.url):
         raise HTTPException(status_code=400, detail="Use a valid YouTube, YouTube Music, or Spotify URL.")
+
+    companion_url = active_companion_url()
+    if companion_url:
+        upstream = await asyncio.to_thread(
+            open_companion_conversion,
+            companion_url,
+            payload,
+            os.getenv("SPOTDL_API_TOKEN", ""),
+        )
+        return companion_audio_response(upstream)
 
     work_directory = Path(tempfile.mkdtemp(prefix="musicpocket-"))
     try:
